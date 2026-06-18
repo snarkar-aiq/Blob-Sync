@@ -27,7 +27,8 @@ fn rename_tif(original_name: &str) -> String {
     let dam_name = parts.get(0..2).unwrap_or(&["unknown"]).join("_");
 
     // Dataset name: satellite_grid_level (S2B_42QZM_L2A) - skip date and orbit
-    let dataset_parts: Vec<&str> = parts.iter()
+    let dataset_parts: Vec<&str> = parts
+        .iter()
         .enumerate()
         .filter(|(i, _)| *i != 4 && *i != 5) // skip date and orbit number
         .skip(2) // skip dam name parts
@@ -219,7 +220,8 @@ async fn upload_file_with_checksum(
 
     let original_name = file_path.split('/').last().unwrap_or(file_path).to_string();
     let renamed_name = rename_tif(&original_name);
-    let object_path = ObjectPath::from(renamed_name.as_str());
+    let raw_path = format!("raw/{}", renamed_name);
+    let object_path = ObjectPath::from(raw_path.as_str());
 
     let mut checksum = None;
     if enable_checksum {
@@ -412,7 +414,8 @@ async fn main() -> Result<()> {
                     .unwrap_or(&file_path)
                     .to_string();
 
-                let file_url = format!("http://localhost:9000/{}/{}", bucket_name, renamed_name);
+                let file_url =
+                    format!("http://localhost:9000/{}/raw/{}", bucket_name, renamed_name);
 
                 let record = db::FileRecord {
                     original_name,
@@ -473,6 +476,10 @@ async fn main() -> Result<()> {
         let speed = total_uploaded as f64 / elapsed.as_secs_f64();
         println!("Average speed: {:.2} MB/s", speed / (1024.0 * 1024.0));
     }
+
+    // TODO: Process raw TIFFs into NDVI, NDWI and MNDWI index maps
+    // This pipeline will read from the raw/ folder in MinIO, compute spectral indices,
+    // and store the resulting index TIFFs in the processed/ folder.
 
     println!("\nMinIO Console: http://localhost:9001");
     println!("Login: minioadmin / minioadmin");

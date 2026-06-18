@@ -1,1 +1,4 @@
 .env
+raw_outputs/
+goals*
+dharoi*
