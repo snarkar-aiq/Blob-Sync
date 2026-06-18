@@ -1,14 +1,103 @@
 use anyhow::{Context, Result};
+use chrono::NaiveDate;
 use dotenv::dotenv;
 use futures::StreamExt;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressStyle};
 use object_store::{aws::AmazonS3Builder, path::Path as ObjectPath, ObjectStore};
+use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::{fs, sync::Semaphore};
+use uuid::Uuid;
 use walkdir::WalkDir;
 
-// Constants for large file handling
+mod db;
+
 const MULTIPART_THRESHOLD: u64 = 50 * 1024 * 1024; // 50MB
+
+fn rename_tif(original_name: &str) -> String {
+    let name_without_ext = original_name.trim_end_matches(".tif");
+    let parts: Vec<&str> = name_without_ext.split('_').collect();
+
+    // Extract date (index 4: dharoi_dam_S2B_42QZM_20260210_0_L2A)
+    let date_str = parts.get(4).unwrap_or(&"19700101");
+    let date = NaiveDate::parse_from_str(date_str, "%Y%m%d")
+        .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+
+    // Dam name: first 2 parts (dharoi_dam)
+    let dam_name = parts.get(0..2).unwrap_or(&["unknown"]).join("_");
+
+    // Dataset name: satellite_grid_level (S2B_42QZM_L2A) - skip date and orbit
+    let dataset_parts: Vec<&str> = parts.iter()
+        .enumerate()
+        .filter(|(i, _)| *i != 4 && *i != 5) // skip date and orbit number
+        .skip(2) // skip dam name parts
+        .map(|(_, p)| *p)
+        .collect();
+    let dataset_name = dataset_parts.join("_");
+
+    let uuid = Uuid::new_v4();
+    format!(
+        "{}_{}_{}_{}.tif",
+        uuid,
+        date.format("%Y%m%d"),
+        dam_name,
+        dataset_name
+    )
+}
+
+fn extract_crs(file_path: &str) -> Option<String> {
+    use std::fs::File;
+    use tiff::decoder::Decoder;
+    use tiff::tags::Tag;
+
+    let file = File::open(file_path).ok()?;
+    let mut decoder = Decoder::new(std::io::BufReader::new(file)).ok()?;
+
+    if let Ok(val) = decoder.get_tag(Tag::GeoAsciiParamsTag) {
+        if let tiff::decoder::ifd::Value::Ascii(s) = val {
+            return Some(s.trim_end_matches('\0').to_string());
+        }
+    }
+
+    if let Ok(val) = decoder.get_tag(Tag::GeoKeyDirectoryTag) {
+        if let tiff::decoder::ifd::Value::List(items) = val {
+            let keys: Vec<u16> = items
+                .into_iter()
+                .filter_map(|v| match v {
+                    tiff::decoder::ifd::Value::Short(x) => Some(x),
+                    _ => None,
+                })
+                .collect();
+            if keys.len() >= 4 {
+                let num_keys = keys[3] as usize;
+                for i in 0..num_keys {
+                    let offset = 4 + (i * 4);
+                    if offset + 4 <= keys.len() {
+                        let key_id = keys[offset];
+                        if key_id == 1024 && keys[offset + 3] == 1 {
+                            let model = match keys[offset + 2] {
+                                1 => "ModelTypeProjected",
+                                2 => "ModelTypeGeographic",
+                                3 => "ModelTypeGeocentric",
+                                _ => "Unknown",
+                            };
+                            return Some(format!("GeoTIFF ModelType: {}", model));
+                        }
+                        if key_id == 1026 {
+                            return Some(format!(
+                                "GeoTIFF Citation key present (tag {})",
+                                keys[offset + 1]
+                            ));
+                        }
+                    }
+                }
+            }
+            return Some("GeoTIFF keys present (no WKT)".to_string());
+        }
+    }
+
+    None
+}
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -19,6 +108,7 @@ struct Config {
     source_dir: String,
     concurrent_uploads: usize,
     enable_checksum: bool,
+    database_url: String,
 }
 
 impl Config {
@@ -27,13 +117,12 @@ impl Config {
             minio_endpoint: std::env::var("MINIO_ENDPOINT")
                 .unwrap_or_else(|_| "http://localhost:9000".to_string()),
             minio_bucket: std::env::var("MINIO_BUCKET")
-                .unwrap_or_else(|_| "sentinel-data-large".to_string()),
+                .unwrap_or_else(|_| "sentinel-2".to_string()),
             minio_access_key: std::env::var("MINIO_ACCESS_KEY")
                 .unwrap_or_else(|_| "minioadmin".to_string()),
             minio_secret_key: std::env::var("MINIO_SECRET_KEY")
                 .unwrap_or_else(|_| "minioadmin".to_string()),
-            source_dir: std::env::var("SOURCE_DIR")
-                .unwrap_or_else(|_| "./test-data-large".to_string()),
+            source_dir: std::env::var("SOURCE_DIR").unwrap_or_else(|_| "./raw_outputs".to_string()),
             concurrent_uploads: std::env::var("CONCURRENT_UPLOADS")
                 .unwrap_or_else(|_| "5".to_string())
                 .parse()
@@ -42,6 +131,9 @@ impl Config {
                 .unwrap_or_else(|_| "true".to_string())
                 .parse()
                 .unwrap_or(true),
+            database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+                "postgres://blobuser:blobpass@localhost:5432/blob_sync".to_string()
+            }),
         })
     }
 }
@@ -55,12 +147,11 @@ async fn upload_large_file_with_progress(
     let size = data.len() as u64;
 
     if size > MULTIPART_THRESHOLD {
-        // For large files, use multipart upload
         use bytes::Bytes;
         use futures::stream::{self, StreamExt};
         use object_store::PutPayload;
 
-        let chunk_size = 10 * 1024 * 1024; // 10MB chunks
+        let chunk_size = 10 * 1024 * 1024;
         let chunks: Vec<Bytes> = data
             .chunks(chunk_size)
             .map(|chunk| Bytes::copy_from_slice(chunk))
@@ -68,24 +159,18 @@ async fn upload_large_file_with_progress(
 
         let total_chunks = chunks.len();
         println!(
-            "   📦 Multipart upload: {} chunks ({} MB each)",
+            "   Multipart upload: {} chunks ({} MB each)",
             total_chunks,
             chunk_size / (1024 * 1024)
         );
 
-        // Create a stream of chunks wrapped in PutPayload
-        let stream = stream::iter(chunks).map(|chunk| {
-            // Convert Bytes to PutPayload::Bytes
-            PutPayload::from(chunk)
-        });
+        let stream = stream::iter(chunks).map(PutPayload::from);
 
-        // Use put_multipart with stream
         let mut upload = store
             .put_multipart(object_path)
             .await
             .context("Failed to start multipart upload")?;
 
-        // Send chunks one by one
         let mut chunk_idx = 0;
         futures::pin_mut!(stream);
         while let Some(payload) = stream.next().await {
@@ -95,22 +180,18 @@ async fn upload_large_file_with_progress(
                 .with_context(|| format!("Failed to upload chunk {}", chunk_idx))?;
             chunk_idx += 1;
 
-            // Update progress every 5 chunks
             if chunk_idx % 5 == 0 {
                 pb.inc(1);
             }
         }
 
-        // Complete the upload
         upload
             .complete()
             .await
             .context("Failed to complete multipart upload")?;
 
-        // Ensure progress bar reflects completion
         pb.inc(1);
     } else {
-        // Small file: single upload
         store
             .put(object_path, data.into())
             .await
@@ -127,33 +208,34 @@ async fn upload_file_with_checksum(
     file_path: &str,
     pb: &ProgressBar,
     enable_checksum: bool,
-) -> Result<u64> {
+) -> Result<(u64, String, Option<String>, Option<String>)> {
     let full_path = format!("{}/{}", source_dir, file_path);
     let metadata = fs::metadata(&full_path).await?;
     let file_size = metadata.len();
 
-    // Read the file
     let data = fs::read(&full_path)
         .await
         .with_context(|| format!("Failed to read file: {}", full_path))?;
 
-    let object_path = ObjectPath::from(file_path);
+    let original_name = file_path.split('/').last().unwrap_or(file_path).to_string();
+    let renamed_name = rename_tif(&original_name);
+    let object_path = ObjectPath::from(renamed_name.as_str());
 
-    // Calculate checksum if enabled
+    let mut checksum = None;
     if enable_checksum {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(&data);
-        let checksum = hex::encode(hasher.finalize());
-
-        // Log checksum
-        println!("   🔐 {}: {}...", file_path, &checksum[..8]);
+        let hash = hex::encode(hasher.finalize());
+        println!("   {}: {}...", original_name, &hash[..8]);
+        checksum = Some(hash);
     }
 
-    // Upload with progress tracking
+    let crs = extract_crs(&full_path);
+
     upload_large_file_with_progress(store, data, &object_path, pb).await?;
 
-    Ok(file_size)
+    Ok((file_size, renamed_name, checksum, crs))
 }
 
 async fn collect_files_with_size(dir: &str) -> Result<Vec<(String, u64)>> {
@@ -166,6 +248,11 @@ async fn collect_files_with_size(dir: &str) -> Result<Vec<(String, u64)>> {
     {
         let path = entry.path();
         if path.is_file() {
+            let ext = path.extension().and_then(|e| e.to_str());
+            if ext != Some("tif") {
+                continue;
+            }
+
             let rel_path = path
                 .strip_prefix(dir)
                 .unwrap_or(path)
@@ -189,14 +276,14 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
 
-    println!("🚀 Starting LARGE Sentinel-2 migration to MinIO");
+    println!("Starting Sentinel-2 migration to MinIO");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("📁 Source: {}", config.source_dir);
-    println!("🎯 Target: {}", config.minio_endpoint);
-    println!("📦 Bucket: {}", config.minio_bucket);
-    println!("🔄 Concurrent uploads: {}", config.concurrent_uploads);
+    println!("Source: {}", config.source_dir);
+    println!("Target: {}", config.minio_endpoint);
+    println!("Bucket: {}", config.minio_bucket);
+    println!("Concurrent uploads: {}", config.concurrent_uploads);
     println!(
-        "🔐 Checksum: {}",
+        "Checksum: {}",
         if config.enable_checksum {
             "enabled"
         } else {
@@ -204,12 +291,17 @@ async fn main() -> Result<()> {
         }
     );
     println!(
-        "📏 Multipart threshold: {} MB",
+        "Multipart threshold: {} MB",
         MULTIPART_THRESHOLD / (1024 * 1024)
     );
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    // Setup MinIO client
+    println!("Connecting to Postgres...");
+    let pool = PgPool::connect(&config.database_url)
+        .await
+        .context("Failed to connect to Postgres")?;
+    println!("Connected to Postgres");
+
     let client = Arc::new(
         AmazonS3Builder::new()
             .with_endpoint(&config.minio_endpoint)
@@ -221,60 +313,50 @@ async fn main() -> Result<()> {
             .context("Failed to build MinIO client")?,
     );
 
-    // Test connection - simplified: just check if we can connect
-    println!("🔗 Testing connection...");
+    println!("Testing MinIO connection...");
 
-    // Try to get the bucket info by listing objects (just one)
     let list_result: Result<_, object_store::Error> = Ok(client.list(None));
 
     match list_result {
         Ok(stream) => {
-            // We have a connection, pin the stream and check if it has items
             let mut pinned_stream = std::pin::pin!(stream);
             match pinned_stream.next().await {
                 Some(Ok(obj)) => {
-                    println!("✅ Connected to MinIO successfully");
-                    println!("   📋 Found existing object: {}", obj.location);
+                    println!("Connected to MinIO successfully");
+                    println!("  Found existing object: {}", obj.location);
                 }
                 Some(Err(e)) => {
-                    println!("⚠️  Connected but error reading objects: {}", e);
-                    println!("   This might be because the bucket doesn't exist yet.");
-                    println!("   Continuing anyway (will create objects on upload)...");
+                    println!("  Connected but error reading objects: {}", e);
+                    println!("  Continuing anyway (will create objects on upload)...");
                 }
                 None => {
-                    println!("✅ Connected to MinIO successfully (bucket is empty)");
+                    println!("Connected to MinIO successfully (bucket is empty)");
                 }
             }
         }
         Err(e) => {
-            println!("❌ Failed to connect to MinIO: {}", e);
-            println!("   Please check:");
-            println!("   - MinIO is running: docker-compose ps");
-            println!("   - Endpoint: {}", config.minio_endpoint);
-            println!("   - Bucket exists: {}", config.minio_bucket);
-            println!("   - Credentials are correct");
-            println!("\n   Continuing anyway (will retry on upload)...");
+            println!("Failed to connect to MinIO: {}", e);
+            println!("  Please check:");
+            println!("  - MinIO is running: docker-compose ps");
+            println!("  - Endpoint: {}", config.minio_endpoint);
+            println!("  - Bucket exists: {}", config.minio_bucket);
+            println!("  - Credentials are correct");
+            println!("\n  Continuing anyway (will retry on upload)...");
         }
     }
 
-    // Collect files with sizes
-    println!("\n📂 Scanning for files...");
+    println!("\nScanning for files...");
     let files = collect_files_with_size(&config.source_dir).await?;
     let total_files = files.len();
     let total_size: u64 = files.iter().map(|(_, size)| size).sum();
 
-    println!(
-        "✅ Found {} files ({})",
-        total_files,
-        HumanBytes(total_size)
-    );
+    println!("Found {} files ({})", total_files, HumanBytes(total_size));
 
     if total_files == 0 {
-        println!("⚠️  No files found. Nothing to do.");
+        println!("No files found. Nothing to do.");
         return Ok(());
     }
 
-    // Setup multi-progress for better visibility
     let multi_pb = MultiProgress::new();
     let main_pb = multi_pb.add(ProgressBar::new(total_files as u64));
     main_pb.set_style(
@@ -284,22 +366,22 @@ async fn main() -> Result<()> {
             .progress_chars("#>-")
     );
 
-    // Add a sub-progress for bytes
     let bytes_pb = multi_pb.add(ProgressBar::new(total_size));
     bytes_pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.yellow} 📊 [{bar:40.green/blue}] {bytes}/{total_bytes} ({bytes_per_sec})")
+            .template(
+                "{spinner:.yellow} [{bar:40.green/blue}] {bytes}/{total_bytes} ({bytes_per_sec})",
+            )
             .unwrap()
-            .progress_chars("▓▒░")
+            .progress_chars("▓▒░"),
     );
     bytes_pb.set_prefix("Uploading");
 
-    // Upload with concurrency
     let semaphore = Arc::new(Semaphore::new(config.concurrent_uploads));
     let mut handles = Vec::new();
     let start_time = std::time::Instant::now();
 
-    println!("\n⬆️  Starting uploads...");
+    println!("\nStarting uploads...");
 
     for (file_path, _file_size) in files {
         let permit = semaphore.clone().acquire_owned().await?;
@@ -308,6 +390,8 @@ async fn main() -> Result<()> {
         let main_pb_clone = main_pb.clone();
         let bytes_pb_clone = bytes_pb.clone();
         let enable_checksum = config.enable_checksum;
+        let pool_clone = pool.clone();
+        let bucket_name = config.minio_bucket.clone();
 
         let handle = tokio::spawn(async move {
             let result = upload_file_with_checksum(
@@ -319,18 +403,39 @@ async fn main() -> Result<()> {
             )
             .await;
 
-            if let Ok(size) = result {
+            if let Ok((size, ref renamed_name, ref checksum, ref crs)) = result {
                 bytes_pb_clone.inc(size);
+
+                let original_name = file_path
+                    .split('/')
+                    .last()
+                    .unwrap_or(&file_path)
+                    .to_string();
+
+                let file_url = format!("http://localhost:9000/{}/{}", bucket_name, renamed_name);
+
+                let record = db::FileRecord {
+                    original_name,
+                    renamed_name: renamed_name.clone(),
+                    bucket_name: bucket_name.clone(),
+                    file_url,
+                    crs: crs.clone(),
+                    file_size: size as i64,
+                    checksum: checksum.clone(),
+                };
+
+                if let Err(e) = db::insert_file_record(&pool_clone, &record).await {
+                    eprintln!("Failed to insert metadata to Postgres: {}", e);
+                }
             }
 
             drop(permit);
-            result
+            result.map(|(size, _, _, _)| size)
         });
 
         handles.push(handle);
     }
 
-    // Wait for all uploads
     let mut successful = 0;
     let mut failed = 0;
     let mut total_uploaded = 0u64;
@@ -342,36 +447,35 @@ async fn main() -> Result<()> {
                 total_uploaded += size;
             }
             Ok(Err(e)) => {
-                eprintln!("❌ Upload failed: {}", e);
+                eprintln!("Upload failed: {}", e);
                 failed += 1;
             }
             Err(e) => {
-                eprintln!("❌ Task panicked: {}", e);
+                eprintln!("Task panicked: {}", e);
                 failed += 1;
             }
         }
     }
 
     let elapsed = start_time.elapsed();
-    main_pb.finish_with_message("✅ Migration complete!");
+    main_pb.finish_with_message("Migration complete!");
     bytes_pb.finish();
 
-    // Summary
-    println!("\n📊 Migration Summary");
+    println!("\nMigration Summary");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("✅ Successful: {}", successful);
-    println!("❌ Failed: {}", failed);
-    println!("📁 Total files: {}", successful + failed);
-    println!("💾 Data uploaded: {}", HumanBytes(total_uploaded));
-    println!("⏱️  Time elapsed: {:.2}s", elapsed.as_secs_f32());
+    println!("Successful: {}", successful);
+    println!("Failed: {}", failed);
+    println!("Total files: {}", successful + failed);
+    println!("Data uploaded: {}", HumanBytes(total_uploaded));
+    println!("Time elapsed: {:.2}s", elapsed.as_secs_f32());
 
     if successful > 0 && elapsed.as_secs_f32() > 0.0 {
         let speed = total_uploaded as f64 / elapsed.as_secs_f64();
-        println!("🚀 Average speed: {:.2} MB/s", speed / (1024.0 * 1024.0));
+        println!("Average speed: {:.2} MB/s", speed / (1024.0 * 1024.0));
     }
 
-    println!("\n🔗 MinIO Console: http://localhost:9001");
-    println!("🔑 Login: minioadmin / minioadmin");
+    println!("\nMinIO Console: http://localhost:9001");
+    println!("Login: minioadmin / minioadmin");
 
     Ok(())
 }
